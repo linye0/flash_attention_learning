@@ -2,6 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import sys
+import numpy as np
 
 # 默认路径
 input_file = 'result/benchmark_data.csv'
@@ -23,6 +24,9 @@ try:
     df = pd.read_csv(input_file, skipinitialspace=True)
     df.columns = df.columns.str.strip()
     # 去除数据中 KernelName 列可能存在的空格
+    df['GFLOPS'] = pd.to_numeric(df['GFLOPS'], errors='coerce')
+    df['Seq_Len(N)'] = pd.to_numeric(df['Seq_Len(N)'], errors='coerce')
+    df = df[np.isfinite(df['GFLOPS']) & (df['GFLOPS'] > 0)]
     df['KernelName'] = df['KernelName'].str.strip()
 except Exception as e:
     print(f"Error reading CSV: {e}")
@@ -48,22 +52,24 @@ if target_kernels:
 # 2. 设置绘图风格
 sns.set_theme(style="whitegrid")
 plt.figure(figsize=(12, 8))
+plt.ylim(0, df['GFLOPS'].max() * 1.1)
 
 # 3. 画折线图
 try:
-    sns.lineplot(data=df, x="Seq_Len(N)", y="Time(ms)", hue="KernelName", 
+    sns.lineplot(data=df, x="Seq_Len(N)", y="GFLOPS", hue="KernelName", 
                  style="KernelName", markers=True, dashes=False, linewidth=2.5)
 except Exception as e:
     print(f"Error plotting data: {e}")
     exit(1)
 
 # 4. 设置标题和标签
-plt.title("Matrix Multiplication Performance Comparison", fontsize=16)
+plt.title("Attention Algorithm Performance Comparison", fontsize=16)
 plt.xlabel("Seq_Len (N)", fontsize=12)
-plt.ylabel("Performance (ms)", fontsize=12)
+plt.ylabel("Performance (GFLOPS)", fontsize=12)
 plt.legend(title="Kernel Implementation", bbox_to_anchor=(1.05, 1), loc='upper left')
 plt.tight_layout()
 
 # 5. 保存图片
 plt.savefig(output_file, dpi=300)
 print(f"Plot saved to {output_file}")
+
