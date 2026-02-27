@@ -107,7 +107,8 @@ __global__ void flash_attn_v2_kernel(
     int bx = blockIdx.x;
     // 这个线程所负责的行
     int wid = tx / 32;
-    int row_idx = bx * Br + tid / 4;
+    int row_idx = bx * Br + tx / 4;
+
 }
 
 // =========================================================

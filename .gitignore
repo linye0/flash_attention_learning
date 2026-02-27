@@ -1,5 +1,5 @@
 # 忽略编译生成目录
-build/
+build
 *.o
 matmul_test
 
