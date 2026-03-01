@@ -2,17 +2,19 @@
 
 ## 朴素实现
 
-Attention公式: 
+Attention公式:
+
 $$
-Attention(Q, K, V) =  softmax\left(\frac{QK^T}{\sqrt{d}}\right)V \tag{1}
+Attention(Q, K, V) = softmax\left(\frac{QK^T}{\sqrt{d}}\right)V \tag{1}
 $$
 
 其中 $Q, K, V$ 的 shape 都是 $(N, d)$，这个计算过程涉及到两个中间矩阵，分别是：
 
 $$
 S = \frac{QK^T}{\sqrt{d}} \tag{2}
-$$ 
-$$ 
+$$
+
+$$
 P = softmax(S) \tag{3}
 $$
 
@@ -22,8 +24,7 @@ $$
 \begin{aligned}
 m_i &= \max_{j = 1}^{i} (x_j) , \quad l_i = \sum_{j = 1}^{i} e^{x_j - m_N} \\
 softmax({x_i}) &= \frac{e^{x_i - m_N}}{l_N}
-\end{aligned}
-\tag{4}
+\end{aligned} \tag{4}
 $$
 
 因此最简单的实现就是按照 attention 的公式一步一步来：
@@ -71,8 +72,7 @@ void launch_v0_cublas(cublasHandle_t handle, const float* Q, const float* K, con
 这里要注意 `cublasSgemm` 内部默认传入的矩阵是列主序的，也就是说当我们向其传入或者传出矩阵的时候，这个矩阵都会被自动转置一次，为了适应这种逻辑，我们需要对 (1) 式子进行一些变形：
 
 $$
-S = \frac{QK^T}{\sqrt{d}} \rightarrow S^T = \frac{KQ^T}{\sqrt{d}}
-\tag{5}
+S = \frac{QK^T}{\sqrt{d}} \rightarrow S^T = \frac{KQ^T}{\sqrt{d}} \tag{5}
 $$
 
 所以第一个矩阵是转置后的 $K$（我们指定一次转置，然后传入又会有一次转置，$K^{TT}=K$），第二个矩阵是 $Q$，第三个矩阵是 $S$。
@@ -85,7 +85,7 @@ $$
 
 $$
 \begin{aligned}
-\text{令 } l'_i &= \sum_{j = 1}^{i} e^{x_j - m_i} \\[1em]
+\text{令 } l'_i &= \sum_{j = 1}^{i} e^{x_j - m_i} \\
 \text{可得 } l'_i &= \sum_{j = 1}^{i} e^{x_j - m_i} \\
                 &= \sum_{j = 1}^{i-1} e^{x_j - m_i} + e^{x_i - m_i}\\
                 &= e^{m_{i-1} - m_i} \cdot \sum_{j= 1}^{i-1} e^{x_j - m_{i - 1}} + e^{x_i - m_i} \\
@@ -102,12 +102,12 @@ $$
 &\textbf{for } i \leftarrow 1, N \textbf{ do} \\
 &\left| \begin{aligned}
     &\quad m_i \leftarrow \max(m_{i-1}, x_i) \\
-    &\quad l'_i \leftarrow l'_{i-1} e^{m_{i-1}-m_i} + e^{x_i-m_i} \hspace{2em} \\
+    &\quad l'_i \leftarrow l'_{i-1} e^{m_{i-1}-m_i} + e^{x_i-m_i} \hspace{2em}
 \end{aligned} \right. \\
-&\textbf{end} \\[1em]
+&\textbf{end} \\
 &\textbf{for } i \leftarrow 1, N \textbf{ do} \\
 &\left| \begin{aligned}
-    &\quad a_i \leftarrow \frac{e^{x_i - m_N}}{l'_N} \hspace{8em} \\
+    &\quad a_i \leftarrow \frac{e^{x_i - m_N}}{l'_N} \hspace{8em}
 \end{aligned} \right. \\
 &\textbf{end}
 \end{aligned}
@@ -128,15 +128,15 @@ $$
 &\left| \begin{aligned}
     &\quad x_i \leftarrow Q[k, :] * K^T[:, i] \\
     &\quad m_i \leftarrow \max(m_{i-1}, x_i) \\
-    &\quad l'_i \leftarrow l'_{i-1} e^{m_{i -1} - m_i} + e^{x_i - m_i} \\
+    &\quad l'_i \leftarrow l'_{i-1} e^{m_{i -1} - m_i} + e^{x_i - m_i}
 \end{aligned} \right. \\
-&\textbf{end} \\[1em]
+&\textbf{end} \\
 &\textbf{for } i \leftarrow 1, N \textbf{ do} \\
 &\left| \begin{aligned}
     &\quad a_i \leftarrow \frac{e^{x_i - m_N}}{l'_N} \\
-    &\quad o_i \leftarrow o_{i - 1} + a_i * V[i, :] \hspace{2em} \textbf{(这是对 O 第 k 行的迭代过程)} \\
+    &\quad o_i \leftarrow o_{i - 1} + a_i * V[i, :] \hspace{2em} \textbf{(这是对 O 第 k 行的迭代过程)}
 \end{aligned} \right. \\
-&\textbf{end} \\[1em]
+&\textbf{end} \\
 &\textbf{O}[k,:] \leftarrow o_N
 \end{aligned}
 $$
@@ -165,7 +165,7 @@ $$
     &l'_i \leftarrow l'_{i-1} e^{m_{i-1}-m_i} + e^{x_i-m_i} \\
     &o'_i \leftarrow o'_{i-1} \frac{l'_{i-1}}{l'_i} e^{m_{i-1}-m_i} + \frac{e^{x_i-m_i}}{l'_i} V[i, :] \hspace{2em} 
 \end{aligned} \right. \\
-&\textbf{end} \\[1em]
+&\textbf{end} \\
 &\hspace{4.5em} O[k, :] \leftarrow o'_N \hspace{10.5em} 
 \end{aligned}
 $$
@@ -178,7 +178,7 @@ $$
 &b : \text{the block size of the tile} \\
 &\#tiles : \text{number of tiles in the row, } N = b * \#tiles \\
 &x_i : \text{a vector storing the } Q * K^T \text{ value of i-th tile } [(i-1)b : ib] \\
-&m_i^{(local)} : \text{the local maximum value inside } x_i. \\[1.5em]
+&m_i^{(local)} : \text{the local maximum value inside } x_i. \\
 &\textbf{Body} \\
 &\textbf{for } i \leftarrow 1, \#tiles \textbf{ do} \\
 &\left| \begin{aligned}
@@ -188,7 +188,7 @@ $$
     &l'_i \leftarrow l'_{i-1} e^{m_{i-1}-m_i} + \sum_{j=1}^b e^{x_i[j]-m_i} \\
     &o'_i \leftarrow o'_{i-1} \frac{l'_{i-1}}{l'_i} e^{m_{i-1}-m_i} + \sum_{j=1}^b \frac{e^{x_i[j]-m_i}}{l'_i} V[j + (i-1)b, :] \hspace{1em}
 \end{aligned} \right. \\
-&\textbf{end} \\[1em]
+&\textbf{end} \\
 &\hspace{14em} O[k, :] \leftarrow o'_{N / b} \hspace{10.5em}
 \end{aligned}
 $$
