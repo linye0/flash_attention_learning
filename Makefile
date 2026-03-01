@@ -1,6 +1,6 @@
 NVCC = nvcc
 
-NVCC_FLAGS = -O3 -std=c++14 --ptxas-options=-v -lcublas
+NVCC_FLAGS = -O3 -std=c++14 --use_fast_math --ptxas-options=-v -lcublas
 
 ARCH_FLAGS = -gencode arch=compute_86,code=sm_86
 

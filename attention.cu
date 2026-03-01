@@ -5,7 +5,7 @@
 #include "attention.h"
 
 // =========================================================
-// 你的战场：手写 V0 版本的 Softmax
+// Kenels
 // =========================================================
 __global__ void softmax_v0_kernel(float* S, float* P, int N) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -94,21 +94,112 @@ __global__ void flash_attn_v1_kernel(
     }
 }
 
+__device__ void load_global_to_shared(const float* src, float* dst, int nrow, int ncol, int bx, int tx) {
+    const float* src_ptr = src + nrow * ncol * bx;
+    for (int i = tx * 4; i < nrow * ncol; i += blockDim.x * 4) *(float4*)(&dst[i]) = *(const float4*)(&src_ptr[i]);
+}
+
+__device__ void load_global_to_shared_2(const float* src, float* dst, int nrow, int ncol, int bx, int tx, const float* src2 = nullptr, float* dst2 = nullptr) {
+    const float* src_ptr = src + nrow * ncol * bx;
+    const float* src2_ptr = src2 + nrow * ncol * bx;
+    for (int i = tx * 4; i < nrow * ncol; i += blockDim.x * 4) *(float4*)(&dst[i]) = *(const float4*)(&src_ptr[i]);
+    for (int i = tx * 4; i < nrow * ncol; i += blockDim.x * 4) *(float4*)(&dst2[i]) = *(const float4*)(&src2_ptr[i]);
+}
+
 __global__ void flash_attn_v2_kernel(
     const float* Q, const float* K, const float* V, float* O,
     int N, int d, int Tc, int Tr, int Bc, int Br, float scale
 ) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+
+    // 这个线程所负责的行
+    int row_id = tx / 4; // 范围: 0-31（对应Br的行索引）
+    int lane_id = tx % 4; // 范围: 0-3（对应一行内的四个分段）
+    int col_offset = lane_id * 16; // 范围: [0, 16, 32, 48]（每个分段的起始位置）
+
     extern __shared__ float sram[];
     float* s_Q = sram;
     float* s_K = s_Q + Br * d;
     float* s_V = s_K + Bc * d;
 
-    int tx = threadIdx.x;
-    int bx = blockIdx.x;
-    // 这个线程所负责的行
-    int wid = tx / 32;
-    int row_idx = bx * Br + tx / 4;
+    float q_frag[16];
+    float k_frag[16];
+    float v_frag[16];
+    float o_reg[16] = {0.0f};
 
+    float m_i = -CUDART_INF_F;
+    float l_i = 0.0f;
+
+    // 阶段1：先从global_mem里面搬运Q到shared_mem的s_Q当中，然后读取到线程私有的寄存器当中
+    load_global_to_shared(Q, s_Q, Br, d, bx, tx);
+    __syncthreads();
+
+    float4* s_Q_ptr = (float4*)(&s_Q[row_id * d + col_offset]);
+    *(float4*)(&q_frag[0]) = s_Q_ptr[0];
+    *(float4*)(&q_frag[4]) = s_Q_ptr[1];
+    *(float4*)(&q_frag[8]) = s_Q_ptr[2];
+    *(float4*)(&q_frag[12]) = s_Q_ptr[3];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) q_frag[i] *= scale;
+
+    // 阶段2
+    for (int j = 0; j < Tc; ++j) {
+        load_global_to_shared_2(K, s_K, Bc, d, j, tx, V, s_V);
+        __syncthreads();
+
+        for (int t = 0; t < Bc; ++t) {
+            float4* s_K_ptr = (float4*)(&s_K[t * d + col_offset]);
+            *(float4*)(&k_frag[0]) = s_K_ptr[0];
+            *(float4*)(&k_frag[4]) = s_K_ptr[1];
+            *(float4*)(&k_frag[8]) = s_K_ptr[2];
+            *(float4*)(&k_frag[12]) = s_K_ptr[3];
+
+            float sum_partial = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                sum_partial += q_frag[i] * k_frag[i];
+            }
+
+            float S_ij = sum_partial;
+            S_ij += __shfl_xor_sync(0xffffffff, S_ij, 1);
+            S_ij += __shfl_xor_sync(0xffffffff, S_ij, 2);
+
+            float m_prev = m_i;
+            m_i = max(m_prev, S_ij);
+            
+            float alpha = expf(m_prev - m_i);
+            float exp_S = expf(S_ij - m_i);
+            l_i = l_i * alpha + exp_S;
+
+            // 5. 加载 V 片段并更新 O 累加器
+            float4* s_V_ptr = (float4*)(&s_V[t * d + col_offset]);
+            *(float4*)(&v_frag[0])  = s_V_ptr[0];
+            *(float4*)(&v_frag[4])  = s_V_ptr[1];
+            *(float4*)(&v_frag[8])  = s_V_ptr[2];
+            *(float4*)(&v_frag[12]) = s_V_ptr[3];
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                o_reg[i] = o_reg[i] * alpha + exp_S * v_frag[i];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        o_reg[i] /= l_i;
+    }
+
+    // 2. 直接向量化写回 (HBM)
+    // 对应 O 的 (bx*Br + row_id) 行，col_offset 列开始的 16 个元素
+    float4* O_ptr = (float4*)(&O[(bx * Br + row_id) * d + col_offset]);
+    O_ptr[0] = *(float4*)(&o_reg[0]);
+    O_ptr[1] = *(float4*)(&o_reg[4]);
+    O_ptr[2] = *(float4*)(&o_reg[8]);
+    O_ptr[3] = *(float4*)(&o_reg[12]);
 }
 
 // =========================================================
@@ -189,7 +280,7 @@ void launch_v2_flash_vectorized(cublasHandle_t handle, const float* Q, const flo
 // 注册列表
 std::vector<KernelInfo> get_kernels() {
     std::vector<KernelInfo> kernels;
-    kernels.push_back({launch_v0_cublas, "V0_Multipass", true});
+    // kernels.push_back({launch_v0_cublas, "V0_Multipass", true});
     kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false});
     kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false});
     // 未来在这里添加 V1, V2...

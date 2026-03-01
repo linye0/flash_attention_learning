@@ -5,7 +5,7 @@
 #include "attention.h"
 
 #define START_N 1024
-#define END_N 46080
+#define END_N 62464
 #define STEP_N 4096
 #define HEAD_DIM 64
 
