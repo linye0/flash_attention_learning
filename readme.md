@@ -193,3 +193,85 @@ $$
 &\hspace{2em} O[k, :] \leftarrow o'_{N_{tiles}}
 \end{aligned}
 $$
+
+## v1算法: 初步实现flash-attention
+
+根据上面的算法流程，写出v1版本的flash-attention kernel：
+
+```cpp
+__global__ void flash_attn_v1_kernel(
+    const float* Q, const float* K, const float* V, float* O,
+    int N, int d, int Tc, int Tr, int Bc, int Br, float scale
+) {
+    extern __shared__ float sram[];
+    float* s_Q = sram;
+    float* s_K = s_Q + Br * d;
+    float* s_V = s_K + Bc * d;
+
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+    int row_idx = bx * Br + tx;
+
+    if (row_idx >= N) return;
+
+    float m_i = -CUDART_INF_F;
+    float l_i = 0.0f;
+
+    float o_reg[64];
+    #pragma unroll
+    for (int k = 0; k < d; ++k) o_reg[k] = 0.0f;
+
+    for (int i = tx; i < Br * d; i += blockDim.x) {
+        s_Q[i] = Q[bx * Br * d + i];
+    }
+
+    __syncthreads();
+
+    for (int j = 0; j < Tc; ++j) {
+        for (int k = tx * 4; k < Bc * d; k += blockDim.x * 4) {
+            // 这边的K是还没有进行转置的
+            *(float4*)(&s_K[k]) = *(float4*)(&K[j * Bc * d + k]);
+            *(float4*)(&s_V[k]) = *(float4*)(&V[j * Bc * d + k]);
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int curr_bc = 0; curr_bc < Bc; ++curr_bc) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < d; ++k) {
+                sum += s_Q[tx * d + k] * s_K[curr_bc * d + k];
+            }
+            sum *= scale;
+
+            float m_prev = m_i;
+            m_i = max(m_prev, sum);
+
+            float alpha = expf(m_prev - m_i);
+            float beta = expf(sum - m_i);
+
+            l_i = l_i * alpha + beta;
+
+            // 重放缩旧的 O 并加上新的 PV 贡献
+            for (int k = 0; k < d; ++k) {
+                o_reg[k] = o_reg[k] * alpha + beta * s_V[curr_bc * d + k];
+            }
+        }
+        __syncthreads(); // 准备进入下一个 KV 块
+    }
+
+    // 6. 最终归一化并写回 HBM
+    for (int k = 0; k < d; ++k) {
+        O[row_idx * d + k] = o_reg[k] / l_i;
+    }
+}
+```
+
+这边我们没有采用公式里面那么复杂的方式来更新o1，而是采用分子分母同时计算，最后综合的方式，可以证明这两种方法是完全等价的，而且实际上代码里面的这种方法更加符合flash-attention这种“块缩放”思想的直觉，对计算单元也更加友好(少了很多除法次数)。
+
+我们比较v1算法和朴素算法的性能表现，数据规模是N=1024到62464，步长4096：
+
+![alt text](image-1.png)
+
+可以发现朴素算法在小规模数据上速度比v1算法更快，这是因为v1算法的矩阵乘是手写的，而朴素算法是调库，性能更优。但是在数据规模增大之后，朴素算法的性能产生了断崖式下跌，这边明显是遇到了访存瓶颈，体现了O(N^2)复杂对于算法性能的毁灭性打击。然后到了N=50000多的关口，朴素算法直接爆显存崩溃了，而v1算法虽然慢，但是在什么数据规模下都能平稳运行。
+
