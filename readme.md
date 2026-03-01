@@ -21,10 +21,11 @@ $$
 在实际的操作当中，因为 softmax 涉及的指数乘法很容易产生溢出，所以必须采用 safe-softmax 算法（下面提到的 softmax 默认都是 safe-softmax），即：
 
 $$
-\begin{aligned}
-m_i &= \max_{j = 1}^{i} (x_j) , \quad l_i = \sum_{j = 1}^{i} e^{x_j - m_N} \\
-softmax({x_i}) &= \frac{e^{x_i - m_N}}{l_N} \qquad \qquad (4)
-\end{aligned}
+m_i = \max_{j = 1}^{i} (x_j) , l_i = \sum_{j = 1}^{i} e^{x_j - m_N} 
+$$
+
+$$
+softmax({x_i}) = \frac{e^{x_i - m_N}}{l_N} \qquad (4)
 $$
 
 因此最简单的实现就是按照 attention 的公式一步一步来：
