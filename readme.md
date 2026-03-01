@@ -177,11 +177,11 @@ $$
 \begin{aligned}
 &\textbf{New Notations} \\
 &b : \text{the block size of the tile} \\
-&\#tiles : \text{number of tiles in the row, } N = b * \#tiles \\
+&N_{tiles} : \text{number of tiles in the row, } N = b * N_{tiles} \\
 &x_i : \text{a vector storing the } Q * K^T \text{ value of i-th tile } [(i-1)b : ib] \\
 &m_i^{(local)} : \text{the local maximum value inside } x_i. \\
 &\textbf{Body} \\
-&\textbf{for } i \leftarrow 1, \#tiles \textbf{ do} \\
+&\textbf{for } i \leftarrow 1, N_{tiles} \textbf{ do} \\
 &\left| \begin{aligned}
     &x_i \leftarrow Q[k, :] K^T [:, (i-1)b : ib] \\
     &m_i^{(local)} = \max_{j=1}^b (x_i[j]) \\
@@ -190,6 +190,6 @@ $$
     &o'_i \leftarrow o'_{i-1} \frac{l'_{i-1}}{l'_i} e^{m_{i-1}-m_i} + \sum_{j=1}^b \frac{e^{x_i[j]-m_i}}{l'_i} V[j + (i-1)b, :]
 \end{aligned} \right. \\
 &\textbf{end} \\
-&\hspace{2em} O[k, :] \leftarrow o'_{N / b}
+&\hspace{2em} O[k, :] \leftarrow o'_{N_{tiles}}
 \end{aligned}
 $$
