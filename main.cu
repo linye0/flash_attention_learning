@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include "attention.h"
+#include <cuda_fp16.h>
 
 #define START_N 1024
 #define END_N 62464
@@ -28,6 +29,20 @@ bool verify_result(const float* gpu_res, const float* cpu_res, int check_rows, i
         }
     }
     return true;
+}
+
+__global__ void float2half_kernel(const float* src, half* dst, size_t num_elements) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) {
+        dst[idx] = __float2half(src[idx]);
+    }
+}
+
+__global__ void half2float_kernel(const half* src, float* dst, size_t num_elements) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) {
+        dst[idx] = __half2float(src[idx]);
+    }
 }
 
 int main() {
@@ -92,14 +107,39 @@ int main() {
                 }
             }   
 
+            void *launch_Q = d_Q, *launch_K = d_K, *launch_V = d_V, *launch_O = d_O;
+            half *d_Q_half = nullptr, *d_K_half = nullptr, *d_V_half = nullptr, *d_O_half = nullptr;
+            size_t elements_QKV = (size_t)N * HEAD_DIM;
+
+            if (kernel.is_halfacc) {
+                CHECK_CUDA(cudaMalloc(&d_Q_half, elements_QKV * sizeof(half)));
+                CHECK_CUDA(cudaMalloc(&d_K_half, elements_QKV * sizeof(half)));
+                CHECK_CUDA(cudaMalloc(&d_V_half, elements_QKV * sizeof(half)));
+                CHECK_CUDA(cudaMalloc(&d_O_half, elements_QKV * sizeof(half)));
+
+                // 2. 调用转换 Kernel，将当前的 FP32 测试数据转为 FP16
+                int threads = 256;
+                int blocks = (elements_QKV + threads - 1) / threads;
+                float2half_kernel<<<blocks, threads>>>(d_Q, d_Q_half, elements_QKV);
+                float2half_kernel<<<blocks, threads>>>(d_K, d_K_half, elements_QKV);
+                float2half_kernel<<<blocks, threads>>>(d_V, d_V_half, elements_QKV);
+                cudaDeviceSynchronize();
+
+                // 3. 将指针切换为 half 版本
+                launch_Q = d_Q_half;
+                launch_K = d_K_half;
+                launch_V = d_V_half;
+                launch_O = d_O_half;
+            }
+
             // 热身
-            kernel.func(handle, d_Q, d_K, d_V, d_O, d_S, d_P, N, HEAD_DIM);
+            kernel.func(handle, launch_Q, launch_K, launch_V, launch_O, d_S, d_P, N, HEAD_DIM);
             cudaDeviceSynchronize();
 
             cudaEventRecord(start);
             int REPEAT = 5;
             for(int r = 0; r < REPEAT; ++r) {
-                kernel.func(handle, d_Q, d_K, d_V, d_O, d_S, d_P, N, HEAD_DIM);
+                kernel.func(handle, launch_Q, launch_K, launch_V, launch_O, d_S, d_P, N, HEAD_DIM);
             }
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);
@@ -113,6 +153,16 @@ int main() {
             printf("%-12d, %-20s, %10.2f, %10.3f\n", N, kernel.name.c_str(), gflops, avg_time);
 
             fflush(stdout);
+
+            if (kernel.is_halfacc) {
+                int threads = 256;
+                int blocks = (elements_QKV + threads - 1) / threads;
+                half2float_kernel<<<blocks, threads>>>(d_O_half, d_O, elements_QKV); // 把 half 结果转回原来的 d_O
+                cudaDeviceSynchronize();
+
+                // 释放临时 FP16 内存
+                cudaFree(d_Q_half); cudaFree(d_K_half); cudaFree(d_V_half); cudaFree(d_O_half);
+            }
 
             // --- 校验逻辑开始 ---
             int check_rows = std::min(N, 100); // 统一校验前 100 行，如果 N 小于 100 则校验全量
