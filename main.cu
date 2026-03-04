@@ -18,12 +18,12 @@
     } \
 }
 
-bool verify_result(const float* gpu_res, const float* cpu_res, int check_rows, int d) {
+bool verify_result(const float* gpu_res, const float* cpu_res, int check_rows, int d, float tolerance) {
     for (int i = 0; i < check_rows * d; ++i) {
         float diff = std::abs(gpu_res[i] - cpu_res[i]);
         // 使用相对误差来评估
         float rel_diff = diff / (std::abs(cpu_res[i]) + 1e-5f);
-        if (rel_diff > 1e-3f) { // 阈值设为 0.1%，对于 FP32 算子是合理的
+        if (rel_diff > tolerance) { // 使用传入的动态阈值
             printf("Error at index %d: GPU=%f, CPU=%f, RelDiff=%f\n", i, gpu_res[i], cpu_res[i], rel_diff);
             return false;
         }
@@ -175,8 +175,10 @@ int main() {
             // 2. 调用我们在 reference.cpp 里定义的局部校验函数
             cpu_attention_reference_partial(h_Q.data(), h_K.data(), h_V.data(), h_O_cpu.data(), N, HEAD_DIM, check_rows);
 
+            float current_tolerance = kernel.is_halfacc ? 5e-2f : 1e-3f;
+
             // 3. 执行比对并打印结果
-            if (!verify_result(h_O_gpu.data(), h_O_cpu.data(), check_rows, HEAD_DIM)) {
+            if (!verify_result(h_O_gpu.data(), h_O_cpu.data(), check_rows, HEAD_DIM, current_tolerance)) {
                 fprintf(stderr, "\n[ERROR] Numerical verification FAILED!\n");
                 fprintf(stderr, "Sequence Length (N): %d\n", N);
                 fprintf(stderr, "Kernel Implementation: %s\n", kernel.name.c_str());

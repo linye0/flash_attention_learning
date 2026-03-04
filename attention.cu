@@ -42,7 +42,8 @@ __global__ void flash_attn_v1_kernel(
     const float* Q, const float* K, const float* V, float* O,
     int N, int d, int Tc, int Tr, int Bc, int Br, float scale
 ) {
-    extern __shared__ float sram[];
+    extern __shared__ char dynamic_sram[];
+    float* sram = (float*)dynamic_sram;
     float* s_Q = sram;
     float* s_K = s_Q + Br * d;
     float* s_V = s_K + Bc * d;
@@ -105,12 +106,12 @@ __global__ void flash_attn_v1_kernel(
     }
 }
 
-__device__ void load_global_to_shared(const float* src, float* dst, int nrow, int ncol, int bx, int tx) {
+__device__ __forceinline__ void load_global_to_shared(const float* src, float* dst, int nrow, int ncol, int bx, int tx) {
     const float* src_ptr = src + nrow * ncol * bx;
     for (int i = tx * 4; i < nrow * ncol; i += blockDim.x * 4) *(float4*)(&dst[i]) = *(const float4*)(&src_ptr[i]);
 }
 
-__device__ void load_global_to_shared_2(const float* src, float* dst, int nrow, int ncol, int bx, int tx, const float* src2 = nullptr, float* dst2 = nullptr) {
+__device__ __forceinline__ void load_global_to_shared_2(const float* src, float* dst, int nrow, int ncol, int bx, int tx, const float* src2 = nullptr, float* dst2 = nullptr) {
     const float* src_ptr = src + nrow * ncol * bx;
     const float* src2_ptr = src2 + nrow * ncol * bx;
     for (int i = tx * 4; i < nrow * ncol; i += blockDim.x * 4) *(float4*)(&dst[i]) = *(const float4*)(&src_ptr[i]);
@@ -129,7 +130,8 @@ __global__ void flash_attn_v2_kernel(
     int lane_id = tx % 4; // 范围: 0-3（对应一行内的四个分段）
     int col_offset = lane_id * 16; // 范围: [0, 16, 32, 48]（每个分段的起始位置）
 
-    extern __shared__ float sram[];
+    extern __shared__ char dynamic_sram[];
+    float* sram = (float*)dynamic_sram;
     float* s_Q = sram;
     float* s_K = s_Q + Br * d;
     float* s_V = s_K + Bc * d;
@@ -213,7 +215,7 @@ __global__ void flash_attn_v2_kernel(
     O_ptr[3] = *(float4*)(&o_reg[12]);
 }
 
-__device__ void load_global_to_shared_async(
+__device__ __forceinline__ void load_global_to_shared_async(
     int stage, const float* src, float* dst, 
     int nrow, int ncol, int bc_idx, int tx
 ) {
@@ -223,6 +225,8 @@ __device__ void load_global_to_shared_async(
     #pragma unroll
     for (int i = tx * 4; i < nrow * ncol; i += blockDim.x * 4) __pipeline_memcpy_async(&dst_ptr[i], &src_ptr[i], 16);
 }
+
+
 
 __global__ void flash_atten_v3_kernel(
     const float* Q, const float* K, const float* V, float* O,
@@ -236,7 +240,8 @@ __global__ void flash_atten_v3_kernel(
     int col_offset = lane_id * 16; // 范围: [0, 16, 32, 48]（每个分段的起始位置）
 
     // 在pipeline读取当中，s_K和s_V的shape都是[2][Bc][d]
-    extern __shared__ float sram[];
+    extern __shared__ char dynamic_sram[];
+    float* sram = (float*)dynamic_sram;
     float* s_Q = sram;
     float* s_K = s_Q + Br * d;
     float* s_V = s_K + 2 * Bc * d;
@@ -286,7 +291,6 @@ __global__ void flash_atten_v3_kernel(
             *(float4*)(&k_frag[8]) = s_K_ptr[2];
             *(float4*)(&k_frag[12]) = s_K_ptr[3];
 
-            
             float sum_partial = 0.0f;
             #pragma unroll
             for (int i = 0; i < 16; ++i) {
@@ -316,10 +320,10 @@ __global__ void flash_atten_v3_kernel(
             }
         }
 
-        __syncthreads();
 
         write_stage ^= 1;
         read_stage ^= 1;
+        __syncthreads();
     }
 
     // 处理最后的K和V读取
@@ -375,6 +379,310 @@ __global__ void flash_atten_v3_kernel(
     O_ptr[1] = *(float4*)(&o_reg[4]);
     O_ptr[2] = *(float4*)(&o_reg[8]);
     O_ptr[3] = *(float4*)(&o_reg[12]);
+}
+
+__device__ __forceinline__ void load_global_to_shared_half(
+    const half* src, half* dst, 
+    int nrow, int ncol, int bc_idx, int tx
+) {
+    const half* src_ptr = src + bc_idx * nrow * ncol;
+    #pragma unroll
+    for (int i = tx * 8; i < nrow * ncol; i += blockDim.x * 8) *((uint4*)(&dst[i])) = *((const uint4*)(&src_ptr[i]));
+}
+
+__device__ __forceinline__ void load_global_to_shared_half_async(
+    int stage, const half* src, half* dst,
+    int nrow, int ncol, int bc_idx, int tx
+) {
+    const half* src_ptr = src + bc_idx * nrow * ncol;
+    half* dst_ptr = dst + stage * nrow * ncol;
+    #pragma unroll
+    for (int i = tx * 8; i < nrow * ncol; i += blockDim.x * 8) __pipeline_memcpy_async(&dst_ptr[i], &src_ptr[i], 16);
+}
+
+__global__ void flash_atten_v4_kernel(
+    const half* Q, const half* K, const half* V, half* O,
+    int N, int d, int Tc, int Tr, int Bc, int Br, float scale
+) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+
+    int warp_id = tx / 32;
+
+    int row_offset_q = warp_id * 16;
+
+    // WMMA frag声明
+    // q_frag的shape就是(16,16)
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> q_frag;
+    // k_frag的shape是(Bc, 16) = (32,16)，如果是K^T则是(16,32)，超出了16*16，所以要两个frag
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag[2];
+    // s,p,v同理，16*32
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> s_frag[2];
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag[2];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag[2];
+    // O是16*d=16*64，分为四段
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag[4];
+    
+    for (int i = 0; i < 4; ++i) wmma::fill_fragment(o_frag[i], 0.0f);
+
+    extern __shared__ char dynamic_sram[];
+    half* sram = (half*)dynamic_sram;
+    half* s_Q = sram;
+    half* s_K = s_Q + Br * d;
+    half* s_V = s_K + 2 * Bc * d;
+    int write_stage = 0;
+    int read_stage = 0;
+
+    float m1 = -CUDART_INF_F, m2 = -CUDART_INF_F;
+    float l1 = 0.0f, l2 = 0.0f;
+
+    load_global_to_shared_half(Q, s_Q, Br, d, bx, tx);
+    __syncthreads();
+
+    // preload
+    load_global_to_shared_half_async(write_stage, K, s_K, Bc, d, 0, tx);
+    load_global_to_shared_half_async(write_stage, V, s_V, Bc, d, 0, tx);
+    write_stage ^= 1;
+    __pipeline_commit();
+
+    for (int j = 1; j < Tc; ++j) {
+        load_global_to_shared_half_async(write_stage, K, s_K, Bc, d, j, tx);
+        load_global_to_shared_half_async(write_stage, V, s_V, Bc, d, j, tx);
+        __pipeline_commit();
+
+        __pipeline_wait_prior(1);
+
+        __syncthreads();
+
+        wmma::fill_fragment(s_frag[0], 0.0f);
+        wmma::fill_fragment(s_frag[1], 0.0f);
+        
+        #pragma unroll
+        for (int ki = 0; ki < d / WMMA_K; ++ki) {
+            const half* q_tile_ptr = s_Q + row_offset_q * d + ki * 16;
+            wmma::load_matrix_sync(q_frag, q_tile_ptr, d);
+
+            // 分别读取K^T的左右两块
+            const half* k_ptr_0 = s_K + read_stage * Bc * d + 0 * d + ki * 16;
+            const half* k_ptr_1 = s_K + read_stage * Bc * d + 16 * d + ki * 16;
+            wmma::load_matrix_sync(k_frag[0], k_ptr_0, d);
+            wmma::load_matrix_sync(k_frag[1], k_ptr_1, d);
+
+            wmma::mma_sync(s_frag[0], q_frag, k_frag[0], s_frag[0]);
+            wmma::mma_sync(s_frag[1], q_frag, k_frag[1], s_frag[1]);
+        }
+
+
+        float m1_local = -CUDART_INF_F, m2_local = -CUDART_INF_F;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float val0 = s_frag[0].x[i] * scale;
+            float val1 = s_frag[1].x[i] * scale;
+            if ((i % 4) < 2) {
+                m1_local = fmaxf(m1_local, fmaxf(val0, val1));
+            } else {
+                m2_local = fmaxf(m2_local,  fmaxf(val0, val1));
+            }
+        }
+
+        #pragma unroll
+        for (int mask = 2; mask > 0; mask >>= 1) {
+            m1_local = fmaxf(m1_local, __shfl_xor_sync(0xffffffff, m1_local, mask));
+            m2_local = fmaxf(m2_local, __shfl_xor_sync(0xffffffff, m2_local, mask));
+        }
+
+        float m1_new = fmaxf(m1, m1_local);
+        float m2_new = fmaxf(m2, m2_local);
+
+        float sum1_local = 0.0f, sum2_local = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float p0, p1;
+            if ((i % 4) < 2) {
+                p0 = expf(s_frag[0].x[i] * scale - m1_new);
+                p1 = expf(s_frag[1].x[i] * scale - m1_new);
+                sum1_local += (p0 + p1);
+            } else {
+                p0 = expf(s_frag[0].x[i] * scale - m2_new);
+                p1 = expf(s_frag[1].x[i] * scale - m2_new);
+                sum2_local += (p0 + p1);
+            }
+            p_frag[0].x[i] = __float2half(p0);
+            p_frag[1].x[i] = __float2half(p1);
+        }
+
+        #pragma unroll
+        for (int mask = 2; mask > 0; mask >>= 1) {
+            sum1_local += __shfl_xor_sync(0xffffffff, sum1_local, mask);
+            sum2_local += __shfl_xor_sync(0xffffffff, sum2_local, mask);
+        }
+
+        float scale1_o = expf(m1 - m1_new);
+        float scale2_o = expf(m2 - m2_new);
+
+        l1 = l1 * scale1_o + sum1_local;
+        l2 = l2 * scale2_o + sum2_local;
+        m1 = m1_new;
+        m2 = m2_new;
+
+        for(int vi=0; vi<4; ++vi) {
+            #pragma unroll
+            for(int i=0; i<8; ++i) {
+                if ((i % 4) < 2) o_frag[vi].x[i] *= scale1_o;
+                else             o_frag[vi].x[i] *= scale2_o;
+            }
+        }
+
+        const half* cur_s_V = s_V + read_stage * Bc * d;
+        for(int vi = 0; vi < 4; ++vi) { // 遍历 V 的 4 个列块 (d=64 / 16 = 4)
+            // 加载 V 的上半部 (行 0-15) 和下半部 (行 16-31)
+            wmma::load_matrix_sync(v_frag[0], cur_s_V + 0 * d + vi * 16, d);
+            wmma::load_matrix_sync(v_frag[1], cur_s_V + 16 * d + vi * 16, d);
+
+            // 矩阵分块乘加：O = P_left * V_top + P_right * V_bottom
+            wmma::mma_sync(o_frag[vi], p_frag[0], v_frag[0], o_frag[vi]);
+            wmma::mma_sync(o_frag[vi], p_frag[1], v_frag[1], o_frag[vi]);
+        }
+
+        write_stage ^= 1;
+        read_stage ^= 1;
+        __syncthreads();
+    }
+
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    wmma::fill_fragment(s_frag[0], 0.0f);
+    wmma::fill_fragment(s_frag[1], 0.0f);
+        
+    #pragma unroll
+    for (int ki = 0; ki < d / WMMA_K; ++ki) {
+        const half* q_tile_ptr = s_Q + row_offset_q * d + ki * 16;
+        wmma::load_matrix_sync(q_frag, q_tile_ptr, d);
+
+        // 分别读取K^T的左右两块
+        const half* k_ptr_0 = s_K + read_stage * Bc * d + 0 * d + ki * 16;
+        const half* k_ptr_1 = s_K + read_stage * Bc * d + 16 * d + ki * 16;
+        wmma::load_matrix_sync(k_frag[0], k_ptr_0, d);
+        wmma::load_matrix_sync(k_frag[1], k_ptr_1, d);
+
+        wmma::mma_sync(s_frag[0], q_frag, k_frag[0], s_frag[0]);
+        wmma::mma_sync(s_frag[1], q_frag, k_frag[1], s_frag[1]);
+    }
+
+    float m1_local = -CUDART_INF_F, m2_local = -CUDART_INF_F;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val0 = s_frag[0].x[i] * scale;
+        float val1 = s_frag[1].x[i] * scale;
+        if ((i % 4) < 2) {
+            m1_local = fmaxf(m1_local, fmaxf(val0, val1));
+        } else {
+            m2_local = fmaxf(m2_local,  fmaxf(val0, val1));
+        }
+    }
+
+    #pragma unroll
+    for (int mask = 2; mask > 0; mask >>= 1) {
+        m1_local = fmaxf(m1_local, __shfl_xor_sync(0xffffffff, m1_local, mask));
+        m2_local = fmaxf(m2_local, __shfl_xor_sync(0xffffffff, m2_local, mask));
+    }
+
+    float m1_new = fmaxf(m1, m1_local);
+    float m2_new = fmaxf(m2, m2_local);
+
+    float sum1_local = 0.0f, sum2_local = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float p0, p1;
+        if ((i % 4) < 2) {
+            p0 = expf(s_frag[0].x[i] * scale - m1_new);
+            p1 = expf(s_frag[1].x[i] * scale - m1_new);
+            sum1_local += (p0 + p1);
+        } else {
+            p0 = expf(s_frag[0].x[i] * scale - m2_new);
+            p1 = expf(s_frag[1].x[i] * scale - m2_new);
+            sum2_local += (p0 + p1);
+        }
+        p_frag[0].x[i] = __float2half(p0);
+        p_frag[1].x[i] = __float2half(p1);
+    }
+
+    #pragma unroll
+    for (int mask = 2; mask > 0; mask >>= 1) {
+        sum1_local += __shfl_xor_sync(0xffffffff, sum1_local, mask);
+        sum2_local += __shfl_xor_sync(0xffffffff, sum2_local, mask);
+    }
+
+    float scale1_o = expf(m1 - m1_new);
+    float scale2_o = expf(m2 - m2_new);
+
+    l1 = l1 * scale1_o + sum1_local;
+    l2 = l2 * scale2_o + sum2_local;
+    m1 = m1_new;
+    m2 = m2_new;
+
+    for(int vi=0; vi<4; ++vi) {
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+            if ((i % 4) < 2) o_frag[vi].x[i] *= scale1_o;
+            else             o_frag[vi].x[i] *= scale2_o;
+        }
+    }
+
+    const half* cur_s_V = s_V + read_stage * Bc * d;
+    for(int vi = 0; vi < 4; ++vi) { // 遍历 V 的 4 个列块 (d=64 / 16 = 4)
+        // 加载 V 的上半部 (行 0-15) 和下半部 (行 16-31)
+        wmma::load_matrix_sync(v_frag[0], cur_s_V + 0 * d + vi * 16, d);
+        wmma::load_matrix_sync(v_frag[1], cur_s_V + 16 * d + vi * 16, d);
+
+        // 矩阵分块乘加：O = P_left * V_top + P_right * V_bottom
+        wmma::mma_sync(o_frag[vi], p_frag[0], v_frag[0], o_frag[vi]);
+        wmma::mma_sync(o_frag[vi], p_frag[1], v_frag[1], o_frag[vi]);
+    }
+
+    // ==========================================
+    // 最终阶段：归一化与写回 (Normalization & Store)
+    // ==========================================
+
+    // 1. 在寄存器内部进行除以 l_i 的归一化操作
+    for(int vi = 0; vi < 4; ++vi) {
+        #pragma unroll
+        for(int i = 0; i < 8; ++i) {
+            if ((i % 4) < 2) {
+                o_frag[vi].x[i] /= l1;
+            } else {
+                o_frag[vi].x[i] /= l2;
+            }
+        }
+    }
+
+    // 2. 物理地址映射与内存写回
+    // 计算当前 Warp 负责的全局 O 矩阵的起始行号
+    int global_row_idx = bx * Br + row_offset_q;
+
+    // 3. 声明 half 类型的目标中转 Fragment
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> o_frag_half;
+
+    // 4. 遍历并写回 4 个 O 分块
+    for(int vi = 0; vi < 4; ++vi) {
+        
+        // 核心修正：在寄存器内部手动完成 float 到 half 的精度截断
+        #pragma unroll
+        for(int i = 0; i < 8; ++i) {
+            o_frag_half.x[i] = __float2half(o_frag[vi].x[i]);
+        }
+
+        // 计算当前子块在 HBM 中的起始指针
+        half* O_ptr = O + global_row_idx * d + vi * 16;
+
+        // 此时指针 (half*) 与 Fragment (half) 类型严格匹配，安全写入
+        wmma::store_matrix_sync(O_ptr, o_frag_half, d, wmma::mem_row_major);
+    }
 }
 
 // =========================================================
@@ -502,7 +810,7 @@ void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* 
     const half* V = reinterpret_cast<const half*>(V_ptr);
     half* O = reinterpret_cast<half*>(O_ptr);
 
-    const int Br = BR;
+    const int Br = 64;
     const int Bc = BC;
 
     const int Tr = (N + Br - 1) / Br;
@@ -530,8 +838,8 @@ void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* 
 // 注册列表
 std::vector<KernelInfo> get_kernels() {
     std::vector<KernelInfo> kernels;
-    // kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false});
-    // kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false});
+    kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false});
+    kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false});
     kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false});
     kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false});
     kernels.push_back({launch_v4_flash_wmma, "V4_flash_wmma", false, true});
