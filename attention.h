@@ -16,9 +16,9 @@ struct KernelInfo {
     std::string name;
     bool is_multipass = false; // 是否需要全部传递S和P
     bool is_halfacc = false; // 是否是半精度算法
+    bool is_decoding = false;
 };
 
 std::vector<KernelInfo> get_kernels();
-void launch_v0_cublas(cublasHandle_t handle, const float* Q, const float* K, const float* V, float* O, float* S, float* P, int N, int d);
 
 #endif

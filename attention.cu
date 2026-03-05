@@ -685,6 +685,159 @@ __global__ void flash_atten_v4_kernel(
     }
 }
 
+__global__ void flash_decoding_partial_kernel(
+    const float* Q, const float* K, const float* V,
+    float* partial_O, float* partial_L, float* partial_M,
+    int N, int d, int Bc, float scale
+) {
+    int tx = threadIdx.x;
+    int split_idx = blockIdx.x;
+
+    int start_n = split_idx * Bc;
+    int end_n = min(start_n + Bc, N);
+
+    // 1. 加载单行 Q 到 Shared Memory (所有线程共用)
+    extern __shared__ float sram[];
+    float* s_Q = sram; 
+    for (int k = tx; k < d; k += blockDim.x) {
+        s_Q[k] = Q[k];
+    }
+    __syncthreads();
+
+    // 2. 线程局部状态初始化
+    float m_i = -CUDART_INF_F;
+    float l_i = 0.0f;
+    float o_reg[64] = {0.0f};
+
+    // -----------------------------------------------------------
+    // 核心：处理 Bc > threads 的情况。每个线程通过循环处理多个 Token
+    // -----------------------------------------------------------
+    for (int i = start_n + tx; i < end_n; i += blockDim.x) {
+        float sum = 0.0f;
+        // 使用 float4 优化 K 的读取 (假设 d=64 且对齐)
+        #pragma unroll
+        for (int k = 0; k < d; k += 4) {
+            float4 k_val = *(const float4*)(&K[i * d + k]);
+            sum += s_Q[k + 0] * k_val.x;
+            sum += s_Q[k + 1] * k_val.y;
+            sum += s_Q[k + 2] * k_val.z;
+            sum += s_Q[k + 3] * k_val.w;
+        }
+        sum *= scale;
+
+        // Online Softmax 更新
+        float m_prev = m_i;
+        m_i = fmaxf(m_prev, sum);
+        float alpha = expf(m_prev - m_i);
+        float beta = expf(sum - m_i);
+
+        l_i = l_i * alpha + beta;
+        #pragma unroll
+        for (int k = 0; k < d; k += 4) {
+            float4 v_val = *(const float4*)(&V[i * d + k]);
+            o_reg[k + 0] = o_reg[k + 0] * alpha + beta * v_val.x;
+            o_reg[k + 1] = o_reg[k + 1] * alpha + beta * v_val.y;
+            o_reg[k + 2] = o_reg[k + 2] * alpha + beta * v_val.z;
+            o_reg[k + 3] = o_reg[k + 3] * alpha + beta * v_val.w;
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 3. 块内归约 (Block-level Reduction)
+    // -----------------------------------------------------------
+    
+    // 第一步：Warp Shuffle 归约 (32 线程合并) [cite: 2026-03-03]
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float m_other = __shfl_xor_sync(0xffffffff, m_i, offset);
+        float l_other = __shfl_xor_sync(0xffffffff, l_i, offset);
+
+        float m_max = fmaxf(m_i, m_other);
+        float a = expf(m_i - m_max);
+        float b = expf(m_other - m_max);
+
+        m_i = m_max;
+        l_i = l_i * a + l_other * b;
+        #pragma unroll
+        for (int k = 0; k < d; ++k) {
+            float o_other = __shfl_xor_sync(0xffffffff, o_reg[k], offset);
+            o_reg[k] = o_reg[k] * a + o_other * b;
+        }
+    }
+
+    // 第二步：跨 Warp 归约 (使用 Shared Memory 交换各 Warp 领头线程的结果)
+    __shared__ float s_m[32]; // 最多支持 1024 线程/32 = 32 个 Warp
+    __shared__ float s_l[32];
+    __shared__ float s_o[32][64];
+
+    int lane = tx % 32;
+    int wid = tx / 32;
+    int num_warps = blockDim.x / 32;
+
+    if (lane == 0) {
+        s_m[wid] = m_i;
+        s_l[wid] = l_i;
+        #pragma unroll
+        for (int k = 0; k < d; ++k) s_o[wid][k] = o_reg[k];
+    }
+    __syncthreads();
+
+    // 第三步：由 tx=0 线程对 4 个 Warp 的结果进行最终合并
+    if (tx == 0) {
+        float M_block = s_m[0];
+        float L_block = s_l[0];
+        float O_block[64];
+        #pragma unroll
+        for (int k = 0; k < d; ++k) O_block[k] = s_o[0][k];
+
+        for (int w = 1; w < num_warps; ++w) {
+            float m_w = s_m[w];
+            float l_w = s_l[w];
+            float m_max = fmaxf(M_block, m_w);
+            float a = expf(M_block - m_max);
+            float b = expf(m_w - m_max);
+
+            L_block = L_block * a + l_w * b;
+            M_block = m_max;
+            #pragma unroll
+            for (int k = 0; k < d; ++k) O_block[k] = O_block[k] * a + s_o[w][k] * b;
+        }
+
+        // 4. 写入 Workspace
+        partial_M[split_idx] = M_block;
+        partial_L[split_idx] = L_block;
+        #pragma unroll
+        for (int k = 0; k < d; ++k) partial_O[split_idx * d + k] = O_block[k];
+    }
+}
+
+__global__ void flash_decoding_reduction_kernel(
+    const float* partial_O, const float* partial_L, const float* partial_M,
+    float* O, int d, int num_splits
+) {
+    int tx = threadIdx.x; // 每个线程负责结果向量的一个维度
+    if (tx >= d) return;
+
+    // 1. 寻找全局最大值 M_global
+    float m_global = -CUDART_INF_F;
+    for (int i = 0; i < num_splits; ++i) {
+        m_global = fmaxf(m_global, partial_M[i]);
+    }
+
+    // 2. 重放缩并累加
+    float l_global = 0.0f;
+    float o_final = 0.0f;
+
+    for (int i = 0; i < num_splits; ++i) {
+        float alpha = expf(partial_M[i] - m_global); // 重放缩因子
+        l_global += partial_L[i] * alpha;
+        o_final += partial_O[i * d + tx] * alpha;
+    }
+
+    // 3. 归一化并写回
+    O[tx] = o_final / l_global;
+}
+
 // =========================================================
 // Launchers
 // =========================================================
@@ -835,14 +988,50 @@ void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* 
     }
 }
 
+void launch_v5_flash_decoding(
+    cublasHandle_t handle, const void* Q_ptr, const void* K_ptr, const void* V_ptr, 
+    void* O_ptr, float* S, float* P, int N, int d
+) {
+    const float* Q = (const float*)Q_ptr;
+    const float* K = (const float*)K_ptr;
+    const float* V = (const float*)V_ptr;
+    float* O = (float*)O_ptr;
+
+    int Bc = 256; // 分片大小，支持 Bc > threads (128)
+    int threads = 128;
+    int num_splits = (N + Bc - 1) / Bc;
+    float scale = 1.0f / sqrtf(d);
+
+    // 1. 分配 Workspace 显存 (生产环境应预分配以避免 overhead)
+    float *d_pO, *d_pL, *d_pM;
+    cudaMalloc(&d_pO, num_splits * d * sizeof(float));
+    cudaMalloc(&d_pL, num_splits * sizeof(float));
+    cudaMalloc(&d_pM, num_splits * sizeof(float));
+
+    // 2. 执行 Partial Kernel
+    // SRAM 大小：s_Q(d) + 额外空间
+    size_t shared_mem = d * sizeof(float); 
+    flash_decoding_partial_kernel<<<num_splits, threads, shared_mem>>>(
+        Q, K, V, d_pO, d_pL, d_pM, N, d, Bc, scale
+    );
+
+    // 3. 执行 Reduction Kernel
+    // 一个 Block 处理所有分片的归约，线程数等于向量维度 d
+    flash_decoding_reduction_kernel<<<1, d>>>(d_pO, d_pL, d_pM, O, d, num_splits);
+
+    // 4. 清理
+    cudaFree(d_pO); cudaFree(d_pL); cudaFree(d_pM);
+}
+
 // 注册列表
 std::vector<KernelInfo> get_kernels() {
     std::vector<KernelInfo> kernels;
-    kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false});
-    kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false});
-    kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false});
-    kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false});
-    kernels.push_back({launch_v4_flash_wmma, "V4_flash_wmma", false, true});
+    //kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false, false});
+    //kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false, false});
+    //kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false, false});
+    //kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false, false});
+    kernels.push_back({launch_v4_flash_wmma, "V4_flash_wmma", false, true, false});
+    // kernels.push_back({launch_v5_flash_decoding, "V5_flash_decoding", false, false, true});
     // 未来在这里添加 V1, V2...
     // kernels.push_back({launch_v1_naive, "01_V1_Naive_Tiled"});
     return kernels;

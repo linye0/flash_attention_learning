@@ -107,6 +107,7 @@ int main() {
                 }
             }   
 
+            int current_Q_rows = kernel.is_decoding? 1 : N;
             void *launch_Q = d_Q, *launch_K = d_K, *launch_V = d_V, *launch_O = d_O;
             half *d_Q_half = nullptr, *d_K_half = nullptr, *d_V_half = nullptr, *d_O_half = nullptr;
             size_t elements_QKV = (size_t)N * HEAD_DIM;
@@ -148,7 +149,8 @@ int main() {
             cudaEventElapsedTime(&milliseconds, start, stop);
             float avg_time = milliseconds / REPEAT;
 
-            double gflops = (4.0 * N * N * HEAD_DIM) / (avg_time * 1e-3) / 1e9;
+            double ops = kernel.is_decoding ? (4.0 * N * HEAD_DIM) : (4.0 * N * N * HEAD_DIM);
+            double gflops = ops / (avg_time * 1e-3) / 1e9;
 
             printf("%-12d, %-20s, %10.2f, %10.3f\n", N, kernel.name.c_str(), gflops, avg_time);
 
@@ -165,20 +167,20 @@ int main() {
             }
 
             // --- 校验逻辑开始 ---
-            int check_rows = std::min(N, 100); // 统一校验前 100 行，如果 N 小于 100 则校验全量
-            std::vector<float> h_O_gpu(N * HEAD_DIM);
-            std::vector<float> h_O_cpu(check_rows * HEAD_DIM);
+            int check_rows = kernel.is_decoding? 1 : std::min(N, 100); // 统一校验前 100 行，如果 N 小于 100 则校验全量
+            std::vector<float> h_O_gpu(current_Q_rows * HEAD_DIM);
+            std::vector<float> h_O_cpu(current_Q_rows * HEAD_DIM);
 
             // 1. 将 GPU 计算出的最终结果 O 拷回 Host
-            CHECK_CUDA(cudaMemcpy(h_O_gpu.data(), d_O, N * HEAD_DIM * sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(h_O_gpu.data(), d_O, current_Q_rows * HEAD_DIM * sizeof(float), cudaMemcpyDeviceToHost));
 
             // 2. 调用我们在 reference.cpp 里定义的局部校验函数
-            cpu_attention_reference_partial(h_Q.data(), h_K.data(), h_V.data(), h_O_cpu.data(), N, HEAD_DIM, check_rows);
+            cpu_attention_reference_partial(h_Q.data(), h_K.data(), h_V.data(), h_O_cpu.data(), N, HEAD_DIM, current_Q_rows);
 
             float current_tolerance = kernel.is_halfacc ? 5e-2f : 1e-3f;
 
             // 3. 执行比对并打印结果
-            if (!verify_result(h_O_gpu.data(), h_O_cpu.data(), check_rows, HEAD_DIM, current_tolerance)) {
+            if (!verify_result(h_O_gpu.data(), h_O_cpu.data(), current_Q_rows, HEAD_DIM, current_tolerance)) {
                 fprintf(stderr, "\n[ERROR] Numerical verification FAILED!\n");
                 fprintf(stderr, "Sequence Length (N): %d\n", N);
                 fprintf(stderr, "Kernel Implementation: %s\n", kernel.name.c_str());
