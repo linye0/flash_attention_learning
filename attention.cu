@@ -1026,13 +1026,11 @@ void launch_v5_flash_decoding(
 // 注册列表
 std::vector<KernelInfo> get_kernels() {
     std::vector<KernelInfo> kernels;
-    //kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false, false});
-    //kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false, false});
-    //kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false, false});
-    //kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false, false});
+    kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false, false});
+    kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false, false});
+    kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false, false});
+    kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false, false});
     kernels.push_back({launch_v4_flash_wmma, "V4_flash_wmma", false, true, false});
     // kernels.push_back({launch_v5_flash_decoding, "V5_flash_decoding", false, false, true});
-    // 未来在这里添加 V1, V2...
-    // kernels.push_back({launch_v1_naive, "01_V1_Naive_Tiled"});
     return kernels;
 }
