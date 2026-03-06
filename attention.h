@@ -21,4 +21,6 @@ struct KernelInfo {
 
 std::vector<KernelInfo> get_kernels();
 
+void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* K_ptr, const void* V_ptr, void* O_ptr, float* S, float* P, int N, int d);
+
 #endif

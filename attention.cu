@@ -4,6 +4,9 @@
 #include <math_constants.h>
 #include <cuda_pipeline.h>
 #include <mma.h>
+#include <memory>         // 必须包含，用于 shared_ptr
+#include <unordered_map>  // 必须包含
+#include <iostream>
 #include "attention.h"
 
 #define BR 32
@@ -1023,14 +1026,20 @@ void launch_v5_flash_decoding(
     cudaFree(d_pO); cudaFree(d_pL); cudaFree(d_pM);
 }
 
+
+
 // 注册列表
 std::vector<KernelInfo> get_kernels() {
     std::vector<KernelInfo> kernels;
-    kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false, false});
-    kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false, false});
-    kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false, false});
-    kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false, false});
+    // kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false, false});
+    // kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false, false});
+    // kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false, false});
+    // kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false, false});
     kernels.push_back({launch_v4_flash_wmma, "V4_flash_wmma", false, true, false});
+    #ifdef USE_CUDNN
+    // 注册 NVIDIA 官方 Baseline
+    kernels.push_back({launch_cudnn_baseline, "Baseline_cuDNN_SDPA", false, false, false});
+    #endif
     // kernels.push_back({launch_v5_flash_decoding, "V5_flash_decoding", false, false, true});
     return kernels;
 }
