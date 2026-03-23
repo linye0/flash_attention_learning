@@ -230,7 +230,6 @@ __device__ __forceinline__ void load_global_to_shared_async(
 }
 
 
-
 __global__ void flash_atten_v3_kernel(
     const float* Q, const float* K, const float* V, float* O,
     int N, int d, int Tc, int Tr, int Bc, int Br, float scale
@@ -474,7 +473,6 @@ __global__ void flash_atten_v4_kernel(
             wmma::mma_sync(s_frag[0], q_frag, k_frag[0], s_frag[0]);
             wmma::mma_sync(s_frag[1], q_frag, k_frag[1], s_frag[1]);
         }
-
 
         float m1_local = -CUDART_INF_F, m2_local = -CUDART_INF_F;
 
@@ -745,11 +743,9 @@ __global__ void flash_decoding_partial_kernel(
         }
     }
 
-    // -----------------------------------------------------------
     // 3. 块内归约 (Block-level Reduction)
-    // -----------------------------------------------------------
     
-    // 第一步：Warp Shuffle 归约 (32 线程合并) [cite: 2026-03-03]
+    // 第一步：Warp Shuffle 归约 (32 线程合并)
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         float m_other = __shfl_xor_sync(0xffffffff, m_i, offset);

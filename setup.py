@@ -6,7 +6,7 @@ setup(
     ext_modules=[
         CUDAExtension('my_flash_attn', [
             'wrapper.cpp',
-            'attention.cu', # 你呕心沥血写出的内核文件
+            'attention.cu',
         ]),
     ],
     cmdclass={
