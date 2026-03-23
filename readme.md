@@ -142,7 +142,7 @@ $$
 \end{aligned}
 $$
 
-我们对计算 $O_i$ 的式子进行变形，代入 $a_i = \frac{e^{x_i - m_N}}{l'_N}$，可得 $O_i = \sum_{j = 1}^{i} \left(\frac{e^{x_j - m_N}}{l'_N} V[j,:]\right)$。
+我们对计算 $O\_i$ 的式子进行变形，代入 $a\_i = \frac{e^{x\_i - m\_N}}{l'\_N}$，可得 $O\_i = \sum_{j = 1}^{i} \left(\frac{e^{x\_j - m\_N}}{l'\_N} V[j,:]\right)$。
 
 同样的，这个式子依赖 $m_N$ 和 $l'_N$，这两个变量都需要循环结束才能得到值，我们仿照之前的方法创建一个序列 $o'$:
 
