@@ -1,27 +1,53 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+
 #include "attention.h"
 
-torch::Tensor run_v4_flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
-    // 1. 获取维度信息
-    int N = Q.size(0); // 假设 shape 是 [N, d]
-    int d = Q.size(1);
+namespace {
 
-    // 2. 让 PyTorch 自动分配输出显存 O (自动在 GPU 上，不用写 cudaMalloc)
-    auto O = torch::empty_like(Q);
-
-    // 3. 抠出裸指针并强转为 half*
-    const void* q_ptr = Q.data_ptr<at::Half>();
-    const void* k_ptr = K.data_ptr<at::Half>();
-    const void* v_ptr = V.data_ptr<at::Half>();
-    void* o_ptr = O.data_ptr<at::Half>();
-
-    // 4. 直接调用你手写的内核！
-    // 注：由于你的 V4 是纯 CUDA 算子不依赖 cuBLAS，handle 传 nullptr 即可
-    launch_v4_flash_wmma(nullptr, q_ptr, k_ptr, v_ptr, o_ptr, nullptr, nullptr, N, d);
-
-    return O;
+void check_inputs(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Q, K and V must be CUDA tensors");
+    TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "Q, K and V must use the same device");
+    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf,
+                "Q, K and V must have dtype torch.float16");
+    TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && v.dim() == 2, "Q, K and V must have shape [N, D]");
+    TORCH_CHECK(q.sizes() == k.sizes() && q.sizes() == v.sizes(), "Q, K and V must have identical shapes");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "Q, K and V must be contiguous");
+    TORCH_CHECK(q.size(1) == 64, "this kernel currently supports head dimension D=64 only");
+    TORCH_CHECK(q.size(0) % 64 == 0, "sequence length N must be a multiple of 64");
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run_v4", &run_v4_flash_attention, "V4 Flash Attention using WMMA");
+torch::Tensor run_v4(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    check_inputs(q, k, v);
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto output = torch::empty_like(q);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    launch_v4_flash_wmma_stream(
+        q.data_ptr<at::Half>(), k.data_ptr<at::Half>(), v.data_ptr<at::Half>(),
+        output.data_ptr<at::Half>(), static_cast<int>(q.size(0)),
+        static_cast<int>(q.size(1)), stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor run_v5(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    check_inputs(q, k, v);
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto output = torch::empty_like(q);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    launch_v5_flash_fa2_wmma_stream(
+        q.data_ptr<at::Half>(), k.data_ptr<at::Half>(), v.data_ptr<at::Half>(),
+        output.data_ptr<at::Half>(), static_cast<int>(q.size(0)),
+        static_cast<int>(q.size(1)), stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+}  // namespace
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    module.def("run_v4", &run_v4, "FlashAttention V4 forward (CUDA, FP16)");
+    module.def("run_v5", &run_v5, "FlashAttention V5 FA2-style forward (CUDA, FP16)");
 }

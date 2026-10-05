@@ -271,7 +271,7 @@ __global__ void flash_attn_v1_kernel(
 
 我们比较v1算法和朴素算法的性能表现，数据规模是N=1024到62464，步长4096：
 
-![alt text](fig/image.png)
+![alt text](../fig/image.png)
 
 可以发现朴素算法在小规模数据上速度比v1算法更快，这是因为v1算法的矩阵乘是手写的，而朴素算法是调库，性能更优。但是在数据规模增大之后，朴素算法的性能产生了断崖式下跌，这边明显是遇到了访存瓶颈，体现了O(N^2)复杂对于算法性能的毁灭性打击。然后到了N=50000多的关口，朴素算法直接爆显存崩溃了，而v1算法虽然慢，但是在什么数据规模下都能平稳运行。
 
@@ -398,7 +398,7 @@ __global__ void flash_attn_v2_kernel(
 
 算法性能如下，有一定程度提升，不过距离高性能仍然差很多，一个问题是没有加入double buffering，导致在每个tile循环内，在从global mem加载数据的时候fma单元都在空等，另一个问题是for循环的矩阵计算还是太低效了，需要后续使用tensor core来改善：
 
-![alt text](fig/image-1.png)
+![alt text](../fig/image-1.png)
 
 ## v3_flash_pipeline算法：加入double buffering掩盖延迟
 
@@ -561,7 +561,7 @@ __global__ void flash_atten_v3_kernel(
 
 相比于v2也有少许的提升，不过不多，可以看出来主要瓶颈还是在低效的矩阵计算上面，我们面临的应该是计算瓶颈，而不是访存瓶颈：
 
-![alt text](fig/image-2.png)
+![alt text](../fig/image-2.png)
 
 ## v4_flash_wmma：引入tensor core进行计算
 

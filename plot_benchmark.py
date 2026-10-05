@@ -1,75 +1,47 @@
-import pandas as pd
+#!/usr/bin/env python3
+"""Plot throughput from attention_bench or the PyTorch benchmark."""
+
+from argparse import ArgumentParser
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
-import sys
-import numpy as np
 
-# 默认路径
-input_file = 'result/benchmark_data.csv'
-output_file = 'result/performance_comparison.png'
 
-# --- [新增] 配置需要画出的模型列表 ---
-# 支持模糊匹配：只要 KernelName 包含列表中的关键词就匹配
-# 例如：target_kernels = ["Double_Buffer", "TensorCore", "cuBLAS"]
-# 如果列表为空 []，则默认画出 CSV 中的所有模型
-target_kernels = [] 
+def main():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("input", nargs="?", default="result/benchmark_data.csv")
+    parser.add_argument("output", nargs="?", default="result/performance_comparison.png")
+    parser.add_argument("--kernel", action="append", default=[])
+    args = parser.parse_args()
 
-if len(sys.argv) > 1:
-    input_file = sys.argv[1]
-if len(sys.argv) > 2:
-    output_file = sys.argv[2]
+    frame = pd.read_csv(args.input, skipinitialspace=True)
+    frame.columns = frame.columns.str.strip()
+    sequence_column = "SequenceLength" if "SequenceLength" in frame else "Seq_Len(N)"
+    frame["KernelName"] = frame["KernelName"].str.strip()
+    frame["GFLOPS"] = pd.to_numeric(frame["GFLOPS"], errors="coerce")
+    frame[sequence_column] = pd.to_numeric(frame[sequence_column], errors="coerce")
+    frame = frame.dropna(subset=[sequence_column, "GFLOPS"])
+    if args.kernel:
+        frame = frame[frame["KernelName"].str.contains("|".join(args.kernel), case=False, na=False)]
+    if frame.empty:
+        raise SystemExit("No benchmark rows matched")
 
-# 1. 读取数据
-try:
-    df = pd.read_csv(input_file, skipinitialspace=True)
-    df.columns = df.columns.str.strip()
-    # 去除数据中 KernelName 列可能存在的空格
-    df['GFLOPS'] = pd.to_numeric(df['GFLOPS'], errors='coerce')
-    df['Seq_Len(N)'] = pd.to_numeric(df['Seq_Len(N)'], errors='coerce')
-    df = df[np.isfinite(df['GFLOPS']) & (df['GFLOPS'] > 0)]
-    df['KernelName'] = df['KernelName'].str.strip()
-except Exception as e:
-    print(f"Error reading CSV: {e}")
-    exit(1)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sns.set_theme(style="whitegrid")
+    figure, axis = plt.subplots(figsize=(12, 7))
+    sns.lineplot(data=frame, x=sequence_column, y="GFLOPS", hue="KernelName",
+                 style="KernelName", markers=True, dashes=False, linewidth=2.2, ax=axis)
+    axis.set_title("FlashAttention Forward Throughput")
+    axis.set_xlabel("Sequence length")
+    axis.set_ylabel("Approximate throughput (GFLOP/s)")
+    axis.legend(title="Implementation", bbox_to_anchor=(1.02, 1), loc="upper left")
+    figure.tight_layout()
+    figure.savefig(output, dpi=200)
+    print(f"Wrote {output}")
 
-# --- [核心修改] 模糊匹配过滤逻辑 ---
-if target_kernels:
-    # 构建正则表达式：匹配包含任意一个关键词的行（不区分大小写）
-    # 例如：["Double_Buffer", "cuBLAS"] -> "Double_Buffer|cuBLAS"
-    pattern = '|'.join(target_kernels)
-    
-    # 使用 str.contains 进行模糊匹配，case=False 表示不区分大小写
-    mask = df['KernelName'].str.contains(pattern, case=False, na=False)
-    df = df[mask]
-    
-    if df.empty:
-        print(f"Warning: No data found for kernels matching {target_kernels}")
-        print(f"Available kernels: {df['KernelName'].unique().tolist()}")
-        exit(1)
-    
-    print(f"Matched kernels: {df['KernelName'].unique().tolist()}")
 
-# 2. 设置绘图风格
-sns.set_theme(style="whitegrid")
-plt.figure(figsize=(12, 8))
-plt.ylim(0, df['GFLOPS'].max() * 1.1)
-
-# 3. 画折线图
-try:
-    sns.lineplot(data=df, x="Seq_Len(N)", y="GFLOPS", hue="KernelName", 
-                 style="KernelName", markers=True, dashes=False, linewidth=2.5)
-except Exception as e:
-    print(f"Error plotting data: {e}")
-    exit(1)
-
-# 4. 设置标题和标签
-plt.title("Attention Algorithm Performance Comparison", fontsize=16)
-plt.xlabel("Seq_Len (N)", fontsize=12)
-plt.ylabel("Performance (GFLOPS)", fontsize=12)
-plt.legend(title="Kernel Implementation", bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.tight_layout()
-
-# 5. 保存图片
-plt.savefig(output_file, dpi=300)
-print(f"Plot saved to {output_file}")
-
+if __name__ == "__main__":
+    main()

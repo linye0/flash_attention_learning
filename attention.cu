@@ -111,6 +111,7 @@ __global__ void flash_attn_v1_kernel(
 
 __device__ __forceinline__ void load_global_to_shared(const float* src, float* dst, int nrow, int ncol, int bx, int tx) {
     const float* src_ptr = src + nrow * ncol * bx;
+    // 每个thread负责一个float4的搬运
     for (int i = tx * 4; i < nrow * ncol; i += blockDim.x * 4) *(float4*)(&dst[i]) = *(const float4*)(&src_ptr[i]);
 }
 
@@ -211,6 +212,7 @@ __global__ void flash_attn_v2_kernel(
 
     // 2. 直接向量化写回 (HBM)
     // 对应 O 的 (bx*Br + row_id) 行，col_offset 列开始的 16 个元素
+    // v是可以各个线程自己算自己的，没有问题，但是KV的计算必须要进行通信，因为这种写法下，四个线程才可以凑出P的一个结果
     float4* O_ptr = (float4*)(&O[(bx * Br + row_id) * d + col_offset]);
     O_ptr[0] = *(float4*)(&o_reg[0]);
     O_ptr[1] = *(float4*)(&o_reg[4]);
@@ -424,7 +426,7 @@ __global__ void flash_atten_v4_kernel(
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag[2];
     // O是16*d=16*64，分为四段
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag[4];
-    
+
     for (int i = 0; i < 4; ++i) wmma::fill_fragment(o_frag[i], 0.0f);
 
     extern __shared__ char dynamic_sram[];
@@ -686,6 +688,182 @@ __global__ void flash_atten_v4_kernel(
     }
 }
 
+// FA2-style work partitioning: one CTA owns 64 query rows and four warps
+// independently own 16 rows. K/V use a two-stage cp.async pipeline, while
+// QK^T and PV are both evaluated with m16n16k16 WMMA fragments.
+__global__ void flash_attn_v5_fa2_wmma_kernel(
+    const half* Q, const half* K, const half* V, half* O,
+    int N, int d, int Tc, int Tr, int Bc, int Br, float scale
+) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+    int warp_id = tx / 32;
+    int row_offset_q = warp_id * 16;
+
+    // WMMA 核心 Fragment：适配 Bc = 64 的大分块
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> q_frag;
+    // K^T 需要 4 个 fragment 覆盖 64 的宽度
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag[4];
+    // S, P 分块
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> s_frag[4];
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag[4];
+    // O 结果维持 4 段 (64 宽度)
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag[4];
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) wmma::fill_fragment(o_frag[i], 0.0f);
+
+    extern __shared__ char dynamic_sram[];
+    half* sram = (half*)dynamic_sram;
+    half* s_Q = sram;
+    half* s_K = s_Q + Br * d;
+    half* s_V = s_K + 2 * Bc * d;
+
+    int write_stage = 0;
+    int read_stage = 0;
+
+    float m1 = -CUDART_INF_F, m2 = -CUDART_INF_F;
+    float l1 = 0.0f, l2 = 0.0f;
+
+    load_global_to_shared_half(Q, s_Q, Br, d, bx, tx);
+    __syncthreads();
+
+    // 预加载阶段
+    load_global_to_shared_half_async(write_stage, K, s_K, Bc, d, 0, tx);
+    load_global_to_shared_half_async(write_stage, V, s_V, Bc, d, 0, tx);
+    write_stage ^= 1;
+    __pipeline_commit();
+
+    for (int j = 1; j <= Tc; ++j) {
+        if (j < Tc) {
+            load_global_to_shared_half_async(write_stage, K, s_K, Bc, d, j, tx);
+            load_global_to_shared_half_async(write_stage, V, s_V, Bc, d, j, tx);
+            __pipeline_commit();
+        }
+        __pipeline_wait_prior(j < Tc ? 1 : 0);
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) wmma::fill_fragment(s_frag[i], 0.0f);
+
+        const half* s_K_stage = s_K + read_stage * Bc * d;
+        const half* s_V_stage = s_V + read_stage * Bc * d;
+
+        // 计算 S = Q * K^T
+        #pragma unroll
+        for (int ki = 0; ki < d / WMMA_K; ++ki) {
+            const half* q_tile_ptr = s_Q + row_offset_q * d + ki * 16;
+            wmma::load_matrix_sync(q_frag, q_tile_ptr, d);
+
+            #pragma unroll
+            for (int vj = 0; vj < 4; ++vj) {
+                const half* k_ptr = s_K_stage + vj * 16 * d + ki * 16;
+                wmma::load_matrix_sync(k_frag[vj], k_ptr, d);
+                wmma::mma_sync(s_frag[vj], q_frag, k_frag[vj], s_frag[vj]);
+            }
+        }
+
+        // Online Softmax 极值提取
+        float m1_local = -CUDART_INF_F, m2_local = -CUDART_INF_F;
+        #pragma unroll
+        for (int vj = 0; vj < 4; ++vj) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float val = s_frag[vj].x[i] * scale;
+                if ((i % 4) < 2) m1_local = fmaxf(m1_local, val);
+                else             m2_local = fmaxf(m2_local, val);
+            }
+        }
+
+        #pragma unroll
+        for (int mask = 2; mask > 0; mask >>= 1) {
+            m1_local = fmaxf(m1_local, __shfl_xor_sync(0xffffffff, m1_local, mask));
+            m2_local = fmaxf(m2_local, __shfl_xor_sync(0xffffffff, m2_local, mask));
+        }
+
+        float m1_new = fmaxf(m1, m1_local);
+        float m2_new = fmaxf(m2, m2_local);
+        float sum1_local = 0.0f, sum2_local = 0.0f;
+
+        #pragma unroll
+        for (int vj = 0; vj < 4; ++vj) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float p_val;
+                if ((i % 4) < 2) {
+                    p_val = expf(s_frag[vj].x[i] * scale - m1_new);
+                    sum1_local += p_val;
+                } else {
+                    p_val = expf(s_frag[vj].x[i] * scale - m2_new);
+                    sum2_local += p_val;
+                }
+                p_frag[vj].x[i] = __float2half(p_val);
+            }
+        }
+
+        #pragma unroll
+        for (int mask = 2; mask > 0; mask >>= 1) {
+            sum1_local += __shfl_xor_sync(0xffffffff, sum1_local, mask);
+            sum2_local += __shfl_xor_sync(0xffffffff, sum2_local, mask);
+        }
+
+        float scale1_o = expf(m1 - m1_new);
+        float scale2_o = expf(m2 - m2_new);
+
+        l1 = l1 * scale1_o + sum1_local;
+        l2 = l2 * scale2_o + sum2_local;
+        m1 = m1_new;
+        m2 = m2_new;
+
+        // 重缩放 O
+        #pragma unroll
+        for(int vi=0; vi<4; ++vi) {
+            #pragma unroll
+            for(int i=0; i<8; ++i) {
+                if ((i % 4) < 2) o_frag[vi].x[i] *= scale1_o;
+                else             o_frag[vi].x[i] *= scale2_o;
+            }
+        }
+
+        // 计算 O += P * V
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag_local;
+        #pragma unroll
+        for (int vi = 0; vi < 4; ++vi) {
+            #pragma unroll
+            for (int vj = 0; vj < 4; ++vj) {
+                const half* v_ptr = s_V_stage + vj * 16 * d + vi * 16;
+                wmma::load_matrix_sync(v_frag_local, v_ptr, d);
+                wmma::mma_sync(o_frag[vi], p_frag[vj], v_frag_local, o_frag[vi]);
+            }
+        }
+
+        write_stage ^= 1;
+        read_stage ^= 1;
+        __syncthreads();
+    }
+
+    // 归一化与写回
+    #pragma unroll
+    for(int vi = 0; vi < 4; ++vi) {
+        #pragma unroll
+        for(int i = 0; i < 8; ++i) {
+            if ((i % 4) < 2) o_frag[vi].x[i] /= l1;
+            else             o_frag[vi].x[i] /= l2;
+        }
+    }
+
+    int global_row_idx = bx * Br + row_offset_q;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> o_frag_half;
+
+    #pragma unroll
+    for(int vi = 0; vi < 4; ++vi) {
+        #pragma unroll
+        for(int i = 0; i < 8; ++i) o_frag_half.x[i] = __float2half(o_frag[vi].x[i]);
+        half* O_ptr = O + global_row_idx * d + vi * 16;
+        wmma::store_matrix_sync(O_ptr, o_frag_half, d, wmma::mem_row_major);
+    }
+}
+
 __global__ void flash_decoding_partial_kernel(
     const float* Q, const float* K, const float* V,
     float* partial_O, float* partial_L, float* partial_M,
@@ -732,7 +910,7 @@ __global__ void flash_decoding_partial_kernel(
         float alpha = expf(m_prev - m_i);
         float beta = expf(sum - m_i);
 
-        l_i = l_i * alpha + beta;
+        l_i = l_i * alpha + beta; // 当前和
         #pragma unroll
         for (int k = 0; k < d; k += 4) {
             float4 v_val = *(const float4*)(&V[i * d + k]);
@@ -774,6 +952,7 @@ __global__ void flash_decoding_partial_kernel(
     int num_warps = blockDim.x / 32;
 
     if (lane == 0) {
+        // warp内领头的线程
         s_m[wid] = m_i;
         s_l[wid] = l_i;
         #pragma unroll
@@ -957,6 +1136,11 @@ void launch_v3_flash_pipeline(cublasHandle_t handle, const void* Q_ptr, const vo
 }
 
 void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* K_ptr, const void* V_ptr, void* O_ptr, float* S, float* P, int N, int d) {
+    launch_v4_flash_wmma_stream(Q_ptr, K_ptr, V_ptr, O_ptr, N, d, 0);
+}
+
+void launch_v4_flash_wmma_stream(const void* Q_ptr, const void* K_ptr, const void* V_ptr,
+                                 void* O_ptr, int N, int d, cudaStream_t stream) {
     const half* Q = reinterpret_cast<const half*>(Q_ptr);
     const half* K = reinterpret_cast<const half*>(K_ptr);
     const half* V = reinterpret_cast<const half*>(V_ptr);
@@ -972,14 +1156,14 @@ void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* 
     dim3 grid(Tr);
     dim3 block(128);
 
-    size_t shared_mem_size = (Br * d + 4 * Bc * d) * sizeof(float);
+    size_t shared_mem_size = (Br * d + 4 * Bc * d) * sizeof(half);
 
     if (shared_mem_size > 48 * 1024) {
         fprintf(stderr, "Error: Shared memory request (%zu bytes) exceeds 48KB limit!\n", shared_mem_size);
         exit(1);
     }
 
-    flash_atten_v4_kernel<<<grid, block, shared_mem_size>>>(Q, K, V, O, N, d, Tc, Tr, Bc, Br, scale);
+    flash_atten_v4_kernel<<<grid, block, shared_mem_size, stream>>>(Q, K, V, O, N, d, Tc, Tr, Bc, Br, scale);
 
     cudaError err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -987,7 +1171,45 @@ void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* 
     }
 }
 
-void launch_v5_flash_decoding(
+void launch_v5_flash_fa2_wmma(cublasHandle_t handle, const void* Q_ptr, const void* K_ptr, const void* V_ptr, void* O_ptr, float* S, float* P, int N, int d) {
+    launch_v5_flash_fa2_wmma_stream(Q_ptr, K_ptr, V_ptr, O_ptr, N, d, 0);
+}
+
+void launch_v5_flash_fa2_wmma_stream(const void* Q_ptr, const void* K_ptr, const void* V_ptr,
+                                     void* O_ptr, int N, int d, cudaStream_t stream) {
+    const half* Q = reinterpret_cast<const half*>(Q_ptr);
+    const half* K = reinterpret_cast<const half*>(K_ptr);
+    const half* V = reinterpret_cast<const half*>(V_ptr);
+    half* O = reinterpret_cast<half*>(O_ptr);
+
+    // One CTA covers 64 queries and streams 64 keys/values per stage.
+    const int Br = 64;
+    const int Bc = 64;
+
+    const int Tr = (N + Br - 1) / Br;
+    const int Tc = (N + Bc - 1) / Bc;
+    const float scale = 1.0f / sqrtf(d);
+
+    dim3 grid(Tr);
+    dim3 block(128);
+
+    // Q uses 8 KiB; double-buffered K/V use 32 KiB: 40 KiB total.
+    size_t shared_mem_size = (Br * d + 4 * Bc * d) * sizeof(half);
+
+    if (shared_mem_size > 48 * 1024) {
+        fprintf(stderr, "Error: Shared memory request (%zu bytes) exceeds 48KB limit!\n", shared_mem_size);
+        exit(1);
+    }
+
+    flash_attn_v5_fa2_wmma_kernel<<<grid, block, shared_mem_size, stream>>>(Q, K, V, O, N, d, Tc, Tr, Bc, Br, scale);
+
+    cudaError err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("FlashAttn V5 Launch Error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+void launch_flash_decoding(
     cublasHandle_t handle, const void* Q_ptr, const void* K_ptr, const void* V_ptr, 
     void* O_ptr, float* S, float* P, int N, int d
 ) {
@@ -1027,15 +1249,16 @@ void launch_v5_flash_decoding(
 // 注册列表
 std::vector<KernelInfo> get_kernels() {
     std::vector<KernelInfo> kernels;
-    // kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false, false});
-    // kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false, false});
-    // kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false, false});
-    // kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false, false});
+    kernels.push_back({launch_v0_cublas, "V0_Multipass", true, false, false, false});
+    kernels.push_back({launch_v1_flash_tiling, "V1_flash_tiling", false, false, false, false});
+    kernels.push_back({launch_v2_flash_vectorized, "V2_flash_vectorized", false, false, false, false});
+    kernels.push_back({launch_v3_flash_pipeline, "V3_flash_pipeline", false, false, false, false});
     kernels.push_back({launch_v4_flash_wmma, "V4_flash_wmma", false, true, false});
+    kernels.push_back({launch_v5_flash_fa2_wmma, "V5_flash_FA2_wmma", false, true, false, false});
     #ifdef USE_CUDNN
     // 注册 NVIDIA 官方 Baseline
     kernels.push_back({launch_cudnn_baseline, "Baseline_cuDNN_SDPA", false, false, false});
     #endif
-    // kernels.push_back({launch_v5_flash_decoding, "V5_flash_decoding", false, false, true});
+    kernels.push_back({launch_flash_decoding, "Flash_decoding", false, false, true, true});
     return kernels;
 }

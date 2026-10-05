@@ -1,6 +1,7 @@
 #ifndef ATTENTION_H
 #define ATTENTION_H
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 #include <string>
 #include <vector>
 
@@ -17,10 +18,15 @@ struct KernelInfo {
     bool is_multipass = false; // 是否需要全部传递S和P
     bool is_halfacc = false; // 是否是半精度算法
     bool is_decoding = false;
+    bool experimental = false;
 };
 
 std::vector<KernelInfo> get_kernels();
 
 void launch_v4_flash_wmma(cublasHandle_t handle, const void* Q_ptr, const void* K_ptr, const void* V_ptr, void* O_ptr, float* S, float* P, int N, int d);
+void launch_v4_flash_wmma_stream(const void* Q_ptr, const void* K_ptr, const void* V_ptr,
+                                 void* O_ptr, int N, int d, cudaStream_t stream);
+void launch_v5_flash_fa2_wmma_stream(const void* Q_ptr, const void* K_ptr, const void* V_ptr,
+                                     void* O_ptr, int N, int d, cudaStream_t stream);
 
 #endif

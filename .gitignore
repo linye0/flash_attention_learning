@@ -1,7 +1,13 @@
 # 忽略编译生成目录
 build/
+build-cmake/
+CMakeFiles/
+CMakeCache.txt
 *.o
 matmul_test
+attention
+attention_bench
+*.so
 
 # 忽略巨大的性能分析数据
 *.csv
@@ -16,3 +22,6 @@ result/
 # 忽略其它文件
 cudnn-frontend/
 *.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
