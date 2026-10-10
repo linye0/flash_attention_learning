@@ -19,6 +19,25 @@ The native harness compares selected output rows with an independent FP32 CPU im
 
 The PyTorch tests additionally check several sequence lengths, current-stream execution, and rejection of invalid device, dtype, and shape inputs.
 
+## Full V0--V5 ladder
+
+The README comparison is generated from one common benchmark invocation so that every kernel sees the same shapes, input seed, validation policy, warmup count, and timing window:
+
+```bash
+./build/attention_bench \
+  --min-n 1024 --max-n 8192 --step 1024 \
+  --warmup 3 --target-ms 200 --min-repeats 5 --max-repeats 100 \
+  --check-rows 32 --seed 42 \
+  --output result/v0_v5_benchmark.csv \
+  2> result/v0_v5_validation.log
+
+python3 plot_benchmark.py \
+  result/v0_v5_benchmark.csv fig/image-2.png \
+  --log-y --title "FlashAttention V0-V5 Throughput on RTX 3060 Laptop GPU"
+```
+
+The sweep is capped at `N=8192` because the V0 multipass baseline materializes two FP32 `N×N` matrices. This keeps V0--V5 in the same chart without exhausting a 6 GB GPU; fused-only long-sequence runs should be reported separately.
+
 ## PyTorch comparison
 
 ```bash

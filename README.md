@@ -56,18 +56,20 @@ The CUDA kernels currently require `D=64` and sequence lengths divisible by 64. 
 
 ## Measured results
 
-On an RTX 3060 Laptop GPU (`sm_86`), the current verified `N=1024, D=64` smoke run produced:
+On an RTX 3060 Laptop GPU (`sm_86`), a unified V0--V5 sweep with three warmups, a 200 ms adaptive timing window, deterministic seed 42, and validation enabled produced the following `N=1024, D=64` results:
 
 | Kernel | Time | Approx. throughput | Validation |
 | --- | ---: | ---: | --- |
-| V0 Multipass | 0.941 ms | 0.285 TFLOP/s | PASS |
-| V1 Tiled | 5.031 ms | 0.053 TFLOP/s | PASS |
-| V2 Vectorized | 0.451 ms | 0.595 TFLOP/s | PASS |
-| V3 Pipeline | 0.453 ms | 0.592 TFLOP/s | PASS |
-| V4 WMMA | 0.088 ms | 3.046 TFLOP/s | PASS |
-| V5 FA2/WMMA | 0.085–0.092 ms | 2.93–3.17 TFLOP/s | PASS |
+| V0 Multipass | 0.937 ms | 0.287 TFLOP/s | PASS |
+| V1 Tiled | 4.155 ms | 0.065 TFLOP/s | PASS |
+| V2 Vectorized | 0.337 ms | 0.797 TFLOP/s | PASS |
+| V3 Pipeline | 0.302 ms | 0.889 TFLOP/s | PASS |
+| V4 WMMA | 0.063 ms | 4.254 TFLOP/s | PASS |
+| V5 FA2/WMMA | 0.062 ms | 4.359 TFLOP/s | PASS |
 
-V4 is about 10.7× faster than the materialized V0 baseline at this small shape. V4 and V5 are close at `N=1024`, with either one leading across short runs. Historical long-sequence runs reached 10.77 TFLOP/s for V4 and 11.53 TFLOP/s for V5 at `N=62,464`. The PyTorch SDPA result from a separate run was 23.78 TFLOP/s, so this project demonstrates the optimization mechanisms but does not claim parity with the production kernel. V5's design and validation evidence are documented in [V5 design](docs/v5-design.md).
+The full sweep covers eight sequence lengths from `N=1024` through `N=8192`: all 48 kernel/shape cases passed validation. At `N=1024`, V5 is about 15.2× faster than the materialized V0 baseline. At `N=8192`, V4 and V5 reach 9.01 and 9.17 TFLOP/s respectively. The sweep stops at 8192 because V0 alone allocates two FP32 `N×N` intermediates (512 MiB total at that shape); the fused kernels can scale much further. V0--V3 use FP32 while V4/V5 use FP16 WMMA, so the chart represents the optimization ladder rather than equal-precision kernel parity.
+
+Raw measurements, correctness output, and the captured environment are available in [`result/v0_v5_benchmark.csv`](result/v0_v5_benchmark.csv), [`result/v0_v5_validation.log`](result/v0_v5_validation.log), and [`result/v0_v5_environment.txt`](result/v0_v5_environment.txt). The logarithmic y-axis keeps all six implementations visible despite their wide performance range.
 
 At `N=62,464`, two FP32 `N×N` intermediates alone would require roughly 31.2 GB. The FP16 fused path stores about 32 MB for Q/K/V/O, excluding small on-chip tiles—why the fused implementation can run this shape on a 6 GB GPU while V0 cannot.
 
